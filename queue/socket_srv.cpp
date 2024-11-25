@@ -28,11 +28,6 @@
 #include <unistd.h>
 #include <errno.h>
 
-#include <sys/wait.h>
-#include <sys/mman.h>
-#include <fcntl.h>
-#include <mqueue.h>
-
 #define STR_CLOSE   "close"
 #define STR_QUIT    "quit"
 
@@ -99,51 +94,6 @@ void help( int t_narg, char **t_args )
 }
 
 //***************************************************************************
-
-typedef struct {
-    int pid;
-    int socket;
-} Client;
-
-typedef struct {
-    Client clients[10];
-    int client_count;
-} ServerInfo;
-
-ServerInfo* serverInfo = nullptr;
-
-int message_queue_fd = -1;
-
-void handle_client(int l_sock_client) {
-    char buf[256];
-
-    while (1) {
-        int l_mq_read = mq_receive(message_queue_fd, buf, sizeof(buf), nullptr);
-        if (l_mq_read > 0) { // data from parent process??
-            write(l_sock_client, buf, l_mq_read);
-        }
-
-        int l_sock_read = read(l_sock_client, buf, sizeof(buf));
-        if (l_sock_read <= 0) { // data from client??
-            log_msg(LOG_ERROR, "Unable to read data from client.");
-            close(l_sock_client);
-            break;
-        }
-
-        if (strncmp(buf, "quit", strlen("close")) == 0) { // request to quit??
-            close(l_sock_client);
-            char pid_to_send[256];
-            int written = snprintf(pid_to_send, sizeof(pid_to_send), "%d", getpid());
-
-            mq_send(message_queue_fd, pid_to_send, written, 1);
-            break;
-        }
-
-        mq_send(message_queue_fd, buf, strlen(buf), 0); // send to parent process
-    }
-
-
-}
 
 int main( int t_narg, char **t_args )
 {
@@ -212,50 +162,18 @@ int main( int t_narg, char **t_args )
 
     log_msg( LOG_INFO, "Enter 'quit' to quit server." );
 
-    int is_mem_first = 0;
-
-    int server_mem_fd = shm_open("/server_info", O_RDWR, 0660);
-
-    if (server_mem_fd < 0) {
-        server_mem_fd = shm_open("/server_info", O_RDWR | O_CREAT, 0660);
-        ftruncate(server_mem_fd, sizeof(ServerInfo));
-        is_mem_first = 1;
-    }
-
-    serverInfo->client_count = 0;
-    for (int i = 0; i < 10; i++) {
-        serverInfo->clients[i].pid = -1;
-        serverInfo->clients[i].socket = -1;
-    }
-
-    serverInfo = (ServerInfo*) mmap(nullptr, sizeof(ServerInfo), PROT_READ | PROT_WRITE, MAP_SHARED, server_mem_fd, 0);
-
-    message_queue_fd = mq_open("/queue", O_RDWR);
-
-    if (message_queue_fd < 0) {
-        mq_attr attrs;
-        bzero(&attrs, sizeof(attrs));
-
-        attrs.mq_flags = 0;
-        attrs.mq_maxmsg = 10;
-        attrs.mq_msgsize = sizeof(int);
-        message_queue_fd = mq_open("/queue", O_RDWR | O_CREAT, 0660, &attrs);
-    }
-
     // go!
     while ( 1 )
     {
         int l_sock_client = -1;
 
         // list of fd sources
-        pollfd l_read_poll[ 3 ];
+        pollfd l_read_poll[ 2 ];
 
         l_read_poll[ 0 ].fd = STDIN_FILENO;
         l_read_poll[ 0 ].events = POLLIN;
         l_read_poll[ 1 ].fd = l_sock_listen;
         l_read_poll[ 1 ].events = POLLIN;
-        l_read_poll[ 2 ].fd = message_queue_fd;
-        l_read_poll[ 2 ].events = POLLIN;
 
         while ( 1 ) // wait for new client
         {
@@ -300,27 +218,6 @@ int main( int t_narg, char **t_args )
                     close( l_sock_listen );
                     exit( 1 );
                 }
-
-                if (fork() == 0) {
-                    for (int i = 0; i < 10; i++) {
-                        if (serverInfo->clients[i].pid != -1) {
-                            close(serverInfo->clients[i].socket);   
-                            break;
-                        }
-                        
-                        serverInfo->clients[i].pid = getpid();
-                        serverInfo->clients[i].socket = l_sock_client;
-                        serverInfo->client_count++;
-                        log_msg(LOG_INFO, "New client connected. Total clients: %d", serverInfo->client_count);
-                    }
-
-                    handle_client(l_sock_client);
-                    close(l_sock_client);
-                    exit(0);
-                }
-
-                wait(NULL);
-
                 uint l_lsa = sizeof( l_srv_addr );
                 // my IP
                 getsockname( l_sock_client, ( sockaddr * ) &l_srv_addr, &l_lsa );
@@ -339,13 +236,79 @@ int main( int t_narg, char **t_args )
         // change source from sock_listen to sock_client
         l_read_poll[ 1 ].fd = l_sock_client;
 
-        char received_data[256];
+        while ( 1  )
+        { // communication
+            char l_buf[ 256 ];
 
-        if (l_read_poll[2].revents & POLLIN) {
-            int l = mq_receive(message_queue_fd, received_data, sizeof(received_data), nullptr);
+            // select from fds
+            int l_poll = poll( l_read_poll, 2, -1 );
 
-            mq_send(message_queue_fd, received_data, l, 0);
-        }
+            if ( l_poll < 0 )
+            {
+                log_msg( LOG_ERROR, "Function poll failed!" );
+                exit( 1 );
+            }
+
+            // data on stdin?
+            if ( l_read_poll[ 0 ].revents & POLLIN )
+            {
+                // read data from stdin
+                int l_len = read( STDIN_FILENO, l_buf, sizeof( l_buf ) );
+                if ( l_len < 0 )
+                    log_msg( LOG_ERROR, "Unable to read data from stdin." );
+                else
+                    log_msg( LOG_DEBUG, "Read %d bytes from stdin.", l_len );
+
+                // send data to client
+                l_len = write( l_sock_client, l_buf, l_len );
+                if ( l_len < 0 )
+                    log_msg( LOG_ERROR, "Unable to send data to client." );
+                else
+                    log_msg( LOG_DEBUG, "Sent %d bytes to client.", l_len );
+            }
+            // data from client?
+            if ( l_read_poll[ 1 ].revents & POLLIN )
+            {
+                // read data from socket
+                int l_len = read( l_sock_client, l_buf, sizeof( l_buf ) );
+                if ( !l_len )
+                {
+                    log_msg( LOG_DEBUG, "Client closed socket!" );
+                    close( l_sock_client );
+                    break;
+                }
+                else if ( l_len < 0 )
+                {
+                    log_msg( LOG_ERROR, "Unable to read data from client." );
+                    close( l_sock_client );
+                    break;
+                }
+                else
+                    log_msg( LOG_DEBUG, "Read %d bytes from client.", l_len );
+
+                // write data to client
+                l_len = write( STDOUT_FILENO, l_buf, l_len );
+                if ( l_len < 0 )
+                    log_msg( LOG_ERROR, "Unable to write data to stdout." );
+
+                // close request?
+                if ( !strncasecmp( l_buf, "close", strlen( STR_CLOSE ) ) )
+                {
+                    log_msg( LOG_INFO, "Client sent 'close' request to close connection." );
+                    close( l_sock_client );
+                    log_msg( LOG_INFO, "Connection closed. Waiting for new client." );
+                    break;
+                }
+            }
+            // request for quit
+            if ( !strncasecmp( l_buf, "quit", strlen( STR_QUIT ) ) )
+            {
+                close( l_sock_listen );
+                close( l_sock_client );
+                log_msg( LOG_INFO, "Request to 'quit' entered" );
+                exit( 0 );
+            }
+        } // while communication
     } // while ( 1 )
 
     return 0;
